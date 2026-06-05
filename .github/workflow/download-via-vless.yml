@@ -1,0 +1,153 @@
+name: Download via VLESS Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: "URL to download"
+        required: false
+        default: "https://engsel.biz.id/vpn/latest.apk"
+      output_filename:
+        description: "Output filename"
+        required: false
+        default: "latest.apk"
+
+jobs:
+  download:
+    name: Connect VLESS & Download
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Xray-core
+        run: |
+          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+          echo "Installing Xray ${XRAY_VERSION}"
+          curl -L "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o xray.zip
+          unzip -q xray.zip xray
+          chmod +x xray
+          sudo mv xray /usr/local/bin/xray
+          xray version
+
+      - name: Write Xray config (VLESS + WS + TLS)
+        run: |
+          cat > /tmp/xray-config.json << 'EOF'
+          {
+            "log": { "loglevel": "warning" },
+            "inbounds": [
+              {
+                "tag": "socks-in",
+                "port": 10808,
+                "listen": "127.0.0.1",
+                "protocol": "socks",
+                "settings": {
+                  "auth": "noauth",
+                  "udp": true
+                }
+              },
+              {
+                "tag": "http-in",
+                "port": 10809,
+                "listen": "127.0.0.1",
+                "protocol": "http"
+              }
+            ],
+            "outbounds": [
+              {
+                "tag": "vless-out",
+                "protocol": "vless",
+                "settings": {
+                  "vnext": [
+                    {
+                      "address": "104.17.3.81",
+                      "port": 8443,
+                      "users": [
+                        {
+                          "id": "1fedf858-0e2a-4e44-8007-7962ca15f052",
+                          "encryption": "none",
+                          "flow": ""
+                        }
+                      ]
+                    }
+                  ]
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "security": "tls",
+                  "tlsSettings": {
+                    "serverName": "engsel.qzz.io",
+                    "allowInsecure": false
+                  },
+                  "wsSettings": {
+                    "path": "/vless",
+                    "headers": {
+                      "Host": "engsel.qzz.io"
+                    }
+                  }
+                }
+              },
+              {
+                "tag": "direct",
+                "protocol": "freedom"
+              }
+            ]
+          }
+          EOF
+
+      - name: Start Xray daemon
+        run: |
+          xray run -c /tmp/xray-config.json &
+          XRAY_PID=$!
+          echo "XRAY_PID=${XRAY_PID}" >> $GITHUB_ENV
+          echo "Waiting for Xray to initialize..."
+          sleep 3
+          # Verify Xray is still running
+          if ! kill -0 $XRAY_PID 2>/dev/null; then
+            echo "ERROR: Xray failed to start"
+            exit 1
+          fi
+          echo "Xray is running (PID: $XRAY_PID)"
+
+      - name: Verify proxy connectivity
+        run: |
+          # Test SOCKS5 proxy reachability
+          curl -x socks5h://127.0.0.1:10808 \
+               --max-time 30 \
+               --retry 3 \
+               --retry-delay 2 \
+               -s -o /dev/null -w "HTTP status: %{http_code}\n" \
+               https://www.google.com || echo "Connectivity check failed (non-fatal)"
+
+      - name: Download file via VLESS proxy
+        run: |
+          DOWNLOAD_URL="${{ github.event.inputs.download_url }}"
+          OUTPUT_FILE="${{ github.event.inputs.output_filename }}"
+
+          echo "Downloading: ${DOWNLOAD_URL}"
+          echo "Output: ${OUTPUT_FILE}"
+
+          curl -x socks5h://127.0.0.1:10808 \
+               --max-time 120 \
+               --retry 3 \
+               --retry-delay 5 \
+               --retry-max-time 180 \
+               -L \
+               -o "${OUTPUT_FILE}" \
+               --progress-bar \
+               "${DOWNLOAD_URL}"
+
+          echo "Download complete. File size: $(du -sh ${OUTPUT_FILE} | cut -f1)"
+
+      - name: Upload downloaded file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-${{ github.event.inputs.output_filename || 'latest.apk' }}
+          path: ${{ github.event.inputs.output_filename || 'latest.apk' }}
+          retention-days: 7
+
+      - name: Stop Xray
+        if: always()
+        run: |
+          if [ -n "$XRAY_PID" ]; then
+            kill $XRAY_PID 2>/dev/null || true
+            echo "Xray stopped."
+          fi
